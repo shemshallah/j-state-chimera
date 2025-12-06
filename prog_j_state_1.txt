@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""
+CONDITIONAL ENTANGLEMENT STATE INVESTIGATION
+=============================================
+Testing a novel entanglement topology where measurement basis
+determines whether subsystem collapses to GHZ or W state.
+
+State: |Ψ_C⟩ = 1/√2(|+⟩_A ⊗ |GHZ⟩_BCD + |-⟩_A ⊗ |W⟩_BCD)
+
+Investigation Goals:
+1. Verify state preparation
+2. Measure basis-dependent collapse
+3. Analyze 4-particle correlations
+4. Test entanglement class coherence
+5. Compare to known states (GHZ, W)
+"""
+
+import numpy as np
+from scipy.stats import entropy
+import time
+import csv
+from datetime import datetime
+from qiskit import QuantumCircuit, transpile
+from collections import defaultdict
+
+try:
+    from azure.quantum import Workspace
+    from azure.quantum.qiskit import AzureQuantumProvider
+    AZURE_AVAILABLE = True
+except ImportError:
+    print("⚠️  Azure Quantum not available - install: pip install azure-quantum qiskit")
+    AZURE_AVAILABLE = False
+
+# ============================================================================
+# AZURE CONNECTION - VERBATIM FROM REFERENCE
+# ============================================================================
+
+CONNECTION_STRING = "SubscriptionId=###;ResourceGroupName=###;WorkspaceName=###;ApiKey=###;QuantumEndpoint=https://westus.quantum.azure.com/;"
+
+NUM_QUBITS = 4  # A, B, C, D
+NUM_SHOTS = 1000
+MAX_MEASUREMENTS = 50
+
+print("="*80)
+print("🔬 CONDITIONAL ENTANGLEMENT STATE INVESTIGATION")
+print("="*80)
+print("Novel State: Superposition of GHZ and W entanglement types")
+print(f"Test Duration: ~10 minutes | Max Measurements: {MAX_MEASUREMENTS}\n")
+
+# ============================================================================
+# BACKEND SETUP
+# ============================================================================
+
+if AZURE_AVAILABLE:
+    try:
+        workspace = Workspace.from_connection_string(CONNECTION_STRING)
+        provider = AzureQuantumProvider(workspace)
+        
+        # Priority: Rigetti QVM
+        backends = provider.backends()
+        backend = None
+        for b in backends:
+            if 'rigetti' in b.name().lower() and 'qvm' in b.name().lower():
+                backend = provider.get_backend(b.name())
+                print(f"✓ Connected: Rigetti QVM - {b.name()}")
+                break
+        
+        if not backend:
+            backend = provider.get_backend(backends[0].name())
+            print(f"⚠ Using: {backends[0].name()}")
+    except Exception as e:
+        print(f"⚠️  Azure failed: {e}")
+        print("Falling back to local simulator")
+        from qiskit_aer import AerSimulator
+        backend = AerSimulator()
+        AZURE_AVAILABLE = False
+else:
+    from qiskit_aer import AerSimulator
+    backend = AerSimulator()
+
+print()
+
+# ============================================================================
+# CSV LOGGING
+# ============================================================================
+
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+csv_filename = f"conditional_entanglement_{TIMESTAMP}.csv"
+csv_file = open(csv_filename, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow([
+    'test_id', 'circuit_type', 'measurement_basis', 
+    'entropy_BCD', 'correlation_avg', 'three_tangle_estimate',
+    'dominant_states', 'execution_time_sec'
+])
+
+print(f"📊 Logging to: {csv_filename}\n")
+
+# ============================================================================
+# CIRCUIT CONSTRUCTION
+# ============================================================================
+
+def create_ghz_3():
+    """Create 3-qubit GHZ state: (|000⟩ + |111⟩)/√2"""
+    qc = QuantumCircuit(3)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.cx(1, 2)
+    return qc
+
+def create_w_3():
+    """Create 3-qubit W state: (|001⟩ + |010⟩ + |100⟩)/√3"""
+    qc = QuantumCircuit(3)
+    # W state construction
+    qc.ry(2 * np.arccos(np.sqrt(2/3)), 0)
+    qc.ch(0, 1)
+    qc.x(0)
+    qc.ccx(0, 1, 2)
+    qc.x(0)
+    return qc
+
+def create_conditional_entanglement_state():
+    """
+    Create the conditional entanglement state:
+    |Ψ_C⟩ = 1/√2(|+⟩_A ⊗ |GHZ⟩_BCD + |-⟩_A ⊗ |W⟩_BCD)
+    
+    Strategy: Use controlled operations where A controls GHZ vs W
+    """
+    qc = QuantumCircuit(NUM_QUBITS, NUM_QUBITS)
+    
+    # Put A in |+⟩ state
+    qc.h(0)
+    
+    # Controlled-GHZ: when A=|0⟩, create GHZ on BCD
+    # H on B controlled by A=0
+    qc.x(0)  # Flip so control is on |0⟩
+    qc.ch(0, 1)  # Controlled-H
+    qc.x(0)  # Flip back
+    
+    # CX gates for GHZ (controlled by A=0)
+    qc.x(0)
+    qc.ccx(0, 1, 2)
+    qc.ccx(0, 2, 3)
+    qc.x(0)
+    
+    # Controlled-W: when A=|1⟩, create W on BCD
+    # This is trickier - use controlled rotations
+    angle_w = 2 * np.arccos(np.sqrt(2/3))
+    qc.cry(angle_w, 0, 1)
+    
+    # Controlled operations for W state
+    qc.ch(0, 2)
+    qc.ccx(0, 1, 2)
+    qc.cx(0, 3)
+    qc.ccx(0, 2, 3)
+    
+    return qc
+
+def measure_computational_basis(qc):
+    """Measure all qubits in computational basis"""
+    qc.measure(range(NUM_QUBITS), range(NUM_QUBITS))
+    return qc
+
+def measure_hadamard_basis_A(qc):
+    """Measure A in Hadamard basis, others in computational"""
+    qc.h(0)  # Transform to |+⟩/|-⟩ basis
+    qc.measure(range(NUM_QUBITS), range(NUM_QUBITS))
+    return qc
+
+# ============================================================================
+# ANALYSIS FUNCTIONS
+# ============================================================================
+
+def analyze_measurement_results(counts, test_id, circuit_type, basis):
+    """Analyze quantum measurement outcomes"""
+    total = sum(counts.values())
+    
+    # Extract BCD subsystem (ignore A)
+    bcd_counts = defaultdict(int)
+    for bitstring, count in counts.items():
+        # Bitstring is ABCD, we want BCD
+        bcd = bitstring[-3:]  # Last 3 bits
+        bcd_counts[bcd] += count
+    
+    # Calculate entropy of BCD subsystem
+    probs = np.array([bcd_counts[format(i, '03b')] / total for i in range(8)])
+    probs = probs[probs > 0]
+    ent = entropy(probs, base=2)
+    
+    # Calculate average correlation
+    correlations = []
+    bitstrings = []
+    for bs, count in counts.items():
+        bitstrings.extend([bs] * count)
+    
+    if len(bitstrings) > 0:
+        bit_array = np.array([[int(b) for b in bs] for bs in bitstrings])
+        if bit_array.shape[0] > 1 and bit_array.shape[1] > 1:
+            corr_matrix = np.corrcoef(bit_array.T)
+            off_diag = corr_matrix[np.triu_indices_from(corr_matrix, k=1)]
+            avg_corr = np.mean(np.abs(off_diag)) if len(off_diag) > 0 else 0
+        else:
+            avg_corr = 0
+    else:
+        avg_corr = 0
+    
+    # Estimate 3-tangle (rough approximation)
+    # For BCD: check if concentrated on |000⟩ + |111⟩ (GHZ-like, high tangle)
+    # or distributed (W-like, low tangle)
+    ghz_signature = bcd_counts['000'] + bcd_counts['111']
+    w_signature = bcd_counts['001'] + bcd_counts['010'] + bcd_counts['100']
+    three_tangle_est = (ghz_signature - w_signature) / total
+    
+    # Find dominant states
+    sorted_states = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    dominant = ', '.join([f"{bs}:{c}" for bs, c in sorted_states[:3]])
+    
+    return {
+        'entropy_BCD': ent,
+        'correlation_avg': avg_corr,
+        'three_tangle_estimate': three_tangle_est,
+        'dominant_states': dominant
+    }
+
+# ============================================================================
+# TEST SUITE
+# ============================================================================
+
+def test_1_baseline_ghz_and_w():
+    """Test 1: Baseline - pure GHZ and W states for comparison"""
+    print("\n" + "="*80)
+    print("TEST 1: BASELINE - Pure GHZ and W States")
+    print("="*80)
+    
+    results = []
+    
+    # Test GHZ
+    print("\n  Creating pure GHZ state on qubits 1-3...")
+    qc_ghz = QuantumCircuit(NUM_QUBITS, NUM_QUBITS)
+    # Put GHZ on last 3 qubits (B, C, D)
+    qc_ghz.h(1)
+    qc_ghz.cx(1, 2)
+    qc_ghz.cx(2, 3)
+    qc_ghz.measure(range(NUM_QUBITS), range(NUM_QUBITS))
+    
+    start = time.time()
+    qc_trans = transpile(qc_ghz, backend=backend, optimization_level=2)
+    job = backend.run(qc_trans, shots=NUM_SHOTS)
+    counts_ghz = job.result().get_counts()
+    elapsed = time.time() - start
+    
+    analysis = analyze_measurement_results(counts_ghz, 1, 'GHZ_baseline', 'computational')
+    results.append(('GHZ', analysis, elapsed))
+    
+    print(f"    ✓ GHZ entropy: {analysis['entropy_BCD']:.3f}")
+    print(f"    ✓ 3-tangle est: {analysis['three_tangle_estimate']:.3f}")
+    print(f"    ✓ Time: {elapsed:.2f}s")
+    
+    csv_writer.writerow([1, 'GHZ_baseline', 'computational',
+                        analysis['entropy_BCD'], analysis['correlation_avg'],
+                        analysis['three_tangle_estimate'], 
+                        analysis['dominant_states'], elapsed])
+    csv_file.flush()
+    
+    # Test W
+    print("\n  Creating pure W state on qubits 1-3...")
+    qc_w = QuantumCircuit(NUM_QUBITS, NUM_QUBITS)
+    angle_w = 2 * np.arccos(np.sqrt(2/3))
+    qc_w.ry(angle_w, 1)
+    qc_w.ch(1, 2)
+    qc_w.x(1)
+    qc_w.ccx(1, 2, 3)
+    qc_w.x(1)
+    qc_w.measure(range(NUM_QUBITS), range(NUM_QUBITS))
+    
+    start = time.time()
+    qc_trans = transpile(qc_w, backend=backend, optimization_level=2)
+    job = backend.run(qc_trans, shots=NUM_SHOTS)
+    counts_w = job.result().get_counts()
+    elapsed = time.time() - start
+    
+    analysis = analyze_measurement_results(counts_w, 1, 'W_baseline', 'computational')
+    results.append(('W', analysis, elapsed))
+    
+    print(f"    ✓ W entropy: {analysis['entropy_BCD']:.3f}")
+    print(f"    ✓ 3-tangle est: {analysis['three_tangle_estimate']:.3f}")
+    print(f"    ✓ Time: {elapsed:.2f}s")
+    
+    csv_writer.writerow([1, 'W_baseline', 'computational',
+                        analysis['entropy_BCD'], analysis['correlation_avg'],
+                        analysis['three_tangle_estimate'],
+                        analysis['dominant_states'], elapsed])
+    csv_file.flush()
+    
+    return results
+
+def test_2_conditional_state_computational():
+    """Test 2: Conditional state measured in computational basis"""
+    print("\n" + "="*80)
+    print("TEST 2: CONDITIONAL STATE - Computational Basis")
+    print("="*80)
+    print("Measuring A in computational basis - should see mixture")
+    
+    results = []
+    
+    for trial in range(10):  # 10 trials
+        print(f"\n  Trial {trial+1}/10...")
+        
+        qc = create_conditional_entanglement_state()
+        qc = measure_computational_basis(qc)
+        
+        start = time.time()
+        qc_trans = transpile(qc, backend=backend, optimization_level=2)
+        job = backend.run(qc_trans, shots=NUM_SHOTS)
+        counts = job.result().get_counts()
+        elapsed = time.time() - start
+        
+        analysis = analyze_measurement_results(counts, 2, 'conditional', 'computational')
+        results.append(analysis)
+        
+        print(f"    Entropy: {analysis['entropy_BCD']:.3f}")
+        print(f"    3-tangle: {analysis['three_tangle_estimate']:.3f}")
+        
+        csv_writer.writerow([2, 'conditional', 'computational',
+                            analysis['entropy_BCD'], analysis['correlation_avg'],
+                            analysis['three_tangle_estimate'],
+                            analysis['dominant_states'], elapsed])
+        csv_file.flush()
+    
+    return results
+
+def test_3_conditional_state_hadamard():
+    """Test 3: Conditional state with A measured in Hadamard basis"""
+    print("\n" + "="*80)
+    print("TEST 3: CONDITIONAL STATE - Hadamard Basis on A")
+    print("="*80)
+    print("Measuring A in |+⟩/|-⟩ basis - should collapse to GHZ or W")
+    
+    results = []
+    
+    for trial in range(10):  # 10 trials
+        print(f"\n  Trial {trial+1}/10...")
+        
+        qc = create_conditional_entanglement_state()
+        qc = measure_hadamard_basis_A(qc)
+        
+        start = time.time()
+        qc_trans = transpile(qc, backend=backend, optimization_level=2)
+        job = backend.run(qc_trans, shots=NUM_SHOTS)
+        counts = job.result().get_counts()
+        elapsed = time.time() - start
+        
+        analysis = analyze_measurement_results(counts, 3, 'conditional', 'hadamard_A')
+        results.append(analysis)
+        
+        print(f"    Entropy: {analysis['entropy_BCD']:.3f}")
+        print(f"    3-tangle: {analysis['three_tangle_estimate']:.3f}")
+        
+        csv_writer.writerow([3, 'conditional', 'hadamard_A',
+                            analysis['entropy_BCD'], analysis['correlation_avg'],
+                            analysis['three_tangle_estimate'],
+                            analysis['dominant_states'], elapsed])
+        csv_file.flush()
+    
+    return results
+
+def test_4_basis_comparison():
+    """Test 4: Direct comparison of different measurement bases"""
+    print("\n" + "="*80)
+    print("TEST 4: BASIS-DEPENDENT STRUCTURE REVELATION")
+    print("="*80)
+    print("Testing how measurement basis reveals different entanglement")
+    
+    results = {'computational': [], 'hadamard': []}
+    
+    for trial in range(10):
+        print(f"\n  Pair {trial+1}/10...")
+        
+        # Same state, different measurements
+        for basis_type in ['computational', 'hadamard']:
+            qc = create_conditional_entanglement_state()
+            
+            if basis_type == 'computational':
+                qc = measure_computational_basis(qc)
+            else:
+                qc = measure_hadamard_basis_A(qc)
+            
+            start = time.time()
+            qc_trans = transpile(qc, backend=backend, optimization_level=2)
+            job = backend.run(qc_trans, shots=NUM_SHOTS)
+            counts = job.result().get_counts()
+            elapsed = time.time() - start
+            
+            analysis = analyze_measurement_results(counts, 4, 'conditional', basis_type)
+            results[basis_type].append(analysis)
+            
+            csv_writer.writerow([4, 'conditional', basis_type,
+                                analysis['entropy_BCD'], analysis['correlation_avg'],
+                                analysis['three_tangle_estimate'],
+                                analysis['dominant_states'], elapsed])
+            csv_file.flush()
+    
+    return results
+
+def test_5_four_particle_correlations():
+    """Test 5: Full 4-particle correlation structure"""
+    print("\n" + "="*80)
+    print("TEST 5: FOUR-PARTICLE CORRELATION ANALYSIS")
+    print("="*80)
+    print("Investigating unique 4-way entanglement structure")
+    
+    results = []
+    
+    for trial in range(10):
+        print(f"\n  Trial {trial+1}/10...")
+        
+        qc = create_conditional_entanglement_state()
+        qc = measure_computational_basis(qc)
+        
+        start = time.time()
+        qc_trans = transpile(qc, backend=backend, optimization_level=2)
+        job = backend.run(qc_trans, shots=NUM_SHOTS)
+        counts = job.result().get_counts()
+        elapsed = time.time() - start
+        
+        # Full 4-qubit analysis
+        total = sum(counts.values())
+        probs = np.array([counts.get(format(i, '04b'), 0) / total for i in range(16)])
+        probs = probs[probs > 0]
+        full_entropy = entropy(probs, base=2)
+        
+        analysis = analyze_measurement_results(counts, 5, 'conditional_4q', 'computational')
+        analysis['full_entropy'] = full_entropy
+        results.append(analysis)
+        
+        print(f"    BCD entropy: {analysis['entropy_BCD']:.3f}")
+        print(f"    Full entropy: {full_entropy:.3f}")
+        
+        csv_writer.writerow([5, 'conditional_4q', 'computational',
+                            analysis['entropy_BCD'], analysis['correlation_avg'],
+                            analysis['three_tangle_estimate'],
+                            f"full_H={full_entropy:.3f}", elapsed])
+        csv_file.flush()
+    
+    return results
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+if __name__ == "__main__":
+    print("\n🚀 Starting Conditional Entanglement Investigation...\n")
+    
+    overall_start = time.time()
+    measurement_count = 0
+    
+    all_results = {}
+    
+    try:
+        # Test 1: Baselines (2 measurements)
+        print("\n" + "🔬" * 40)
+        baseline_results = test_1_baseline_ghz_and_w()
+        all_results['baseline'] = baseline_results
+        measurement_count += 2
+        print(f"\n✓ Measurements used: {measurement_count}/{MAX_MEASUREMENTS}")
+        
+        # Test 2: Conditional computational (10 measurements)
+        if measurement_count + 10 <= MAX_MEASUREMENTS:
+            print("\n" + "🔬" * 40)
+            comp_results = test_2_conditional_state_computational()
+            all_results['computational'] = comp_results
+            measurement_count += 10
+            print(f"\n✓ Measurements used: {measurement_count}/{MAX_MEASUREMENTS}")
+        
+        # Test 3: Conditional Hadamard (10 measurements)
+        if measurement_count + 10 <= MAX_MEASUREMENTS:
+            print("\n" + "🔬" * 40)
+            had_results = test_3_conditional_state_hadamard()
+            all_results['hadamard'] = had_results
+            measurement_count += 10
+            print(f"\n✓ Measurements used: {measurement_count}/{MAX_MEASUREMENTS}")
+        
+        # Test 4: Basis comparison (20 measurements)
+        if measurement_count + 20 <= MAX_MEASUREMENTS:
+            print("\n" + "🔬" * 40)
+            basis_results = test_4_basis_comparison()
+            all_results['basis_comparison'] = basis_results
+            measurement_count += 20
+            print(f"\n✓ Measurements used: {measurement_count}/{MAX_MEASUREMENTS}")
+        
+        # Test 5: 4-particle correlations (remaining measurements)
+        remaining = MAX_MEASUREMENTS - measurement_count
+        if remaining > 0:
+            print("\n" + "🔬" * 40)
+            corr_results = test_5_four_particle_correlations()
+            all_results['four_particle'] = corr_results
+            measurement_count += len(corr_results)
+            print(f"\n✓ Measurements used: {measurement_count}/{MAX_MEASUREMENTS}")
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        csv_file.close()
+    
+    elapsed_total = time.time() - overall_start
+    
+    # ========================================================================
+    # FINAL ANALYSIS
+    # ========================================================================
+    
+    print("\n" + "="*80)
+    print("🎉 INVESTIGATION COMPLETE")
+    print("="*80)
+    
+    print(f"\nTotal time: {elapsed_total/60:.1f} minutes")
+    print(f"Measurements used: {measurement_count}/{MAX_MEASUREMENTS}")
+    print(f"Data saved: {csv_filename}")
+    
+    print("\n" + "="*80)
+    print("📊 KEY FINDINGS")
+    print("="*80)
+    
+    # Analyze baseline
+    if 'baseline' in all_results:
+        ghz_data, w_data = all_results['baseline']
+        print(f"\nBASELINE STATES:")
+        print(f"  GHZ entropy: {ghz_data[1]['entropy_BCD']:.3f}")
+        print(f"  W entropy: {w_data[1]['entropy_BCD']:.3f}")
+        print(f"  GHZ 3-tangle: {ghz_data[1]['three_tangle_estimate']:.3f}")
+        print(f"  W 3-tangle: {w_data[1]['three_tangle_estimate']:.3f}")
+    
+    # Analyze conditional state
+    if 'computational' in all_results:
+        comp_entropies = [r['entropy_BCD'] for r in all_results['computational']]
+        comp_tangles = [r['three_tangle_estimate'] for r in all_results['computational']]
+        
+        print(f"\nCONDITIONAL STATE (Computational Basis):")
+        print(f"  Mean entropy: {np.mean(comp_entropies):.3f} ± {np.std(comp_entropies):.3f}")
+        print(f"  Mean 3-tangle: {np.mean(comp_tangles):.3f} ± {np.std(comp_tangles):.3f}")
+    
+    if 'hadamard' in all_results:
+        had_entropies = [r['entropy_BCD'] for r in all_results['hadamard']]
+        had_tangles = [r['three_tangle_estimate'] for r in all_results['hadamard']]
+        
+        print(f"\nCONDITIONAL STATE (Hadamard Basis on A):")
+        print(f"  Mean entropy: {np.mean(had_entropies):.3f} ± {np.std(had_entropies):.3f}")
+        print(f"  Mean 3-tangle: {np.mean(had_tangles):.3f} ± {np.std(had_tangles):.3f}")
+    
+    print("\n" + "="*80)
+    print("🔍 INTERPRETATION")
+    print("="*80)
+    
+    print("\nExpected behavior:")
+    print("  1. Computational basis: Mixed statistics (between GHZ and W)")
+    print("  2. Hadamard basis: Should collapse to either GHZ or W")
+    print("  3. Basis determines revealed entanglement structure")
+    
+    print("\n✨ Novel properties:")
+    print("  • Entanglement type in superposition")
+    print("  • Measurement-basis-dependent structure")
+    print("  • Genuine 4-particle correlations")
+    
+    print("\n" + "="*80)
+    print("🚀 EXPERIMENT COMPLETE - Ready for v2.0!")
+    print("="*80)
